@@ -1,0 +1,182 @@
+name: build-ps4-cachyos-rootfs
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'rootfs-v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    env:
+      ISO_VERSION: '260809'
+      ISO_URL: 'https://mirror.cachyos.org/ISO/desktop/260809/cachyos-desktop-linux-260809.iso'
+      PS4VIDEO_REPO: 'https://raw.githubusercontent.com/DionKill/ps4-video-archlinux/main/repo'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------
+      # Reclaim runner disk: preinstalled toolchains are ~10GB and unused
+      # ---------------------------------------------------------------
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" \
+                      /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      # ---------------------------------------------------------------
+      # Cache the 3.2GB ISO so rebuilds don't re-download it
+      # ---------------------------------------------------------------
+      - name: Restore ISO cache
+        id: iso-cache
+        uses: actions/cache@v4
+        with:
+          path: iso
+          key: cachyos-iso-${{ env.ISO_VERSION }}
+
+      - name: Download CachyOS ISO
+        run: |
+          mkdir -p iso
+          if [ ! -s iso/cachyos.iso ]; then
+            echo "Cache miss - downloading ISO..."
+            curl -L --retry 3 --retry-delay 5 --max-time 2400 \
+              -o iso/cachyos.iso "$ISO_URL"
+          else
+            echo "ISO from cache"
+          fi
+          ls -lh iso/cachyos.iso
+
+      # ---------------------------------------------------------------
+      # Cache the PS4-patched Mesa stack (small, avoids 404 risk later)
+      # ---------------------------------------------------------------
+      - name: Cache PS4 video packages
+        uses: actions/cache@v4
+        with:
+          path: ps4video
+          key: ps4video-pkgs-v1
+
+      - name: Fetch PS4-patched Mesa packages
+        run: |
+          mkdir -p ps4video
+          cd ps4video
+          base="$PS4VIDEO_REPO"
+          for f in \
+            mesa-ps4-26.0.4.217906.bbc23bed47f.2fc1477-1-x86_64.pkg.tar.zst \
+            lib32-mesa-ps4-26.0.4.217906.bbc23bed47f.2fc1477-1-x86_64.pkg.tar.zst \
+            libdrm-ps4-2.4.131.r4.gb9dea73d-1-x86_64.pkg.tar.zst \
+            xf86-video-amdgpu-ps4-25.0.0-1-x86_64.pkg.tar.zst ; do
+              [ -s "$f" ] || curl -sSL --retry 3 -o "$f" "$base/$f"
+          done
+          zstd -t *.pkg.tar.zst && ls -lh
+
+      # ---------------------------------------------------------------
+      # Extract the CachyOS rootfs from the ISO squashfs
+      # ---------------------------------------------------------------
+      - name: Extract rootfs
+        run: |
+          sudo mkdir -p /mnt/iso /mnt/work
+          sudo mount -o loop,ro iso/cachyos.iso /mnt/iso
+          SFS=$(sudo find /mnt/iso -name 'airootfs.sfs' -o -name 'rootfs.sfs' | head -1)
+          echo "squashfs: $SFS"
+          sudo unsquashfs -f -d /mnt/work/rootfs "$SFS"
+          sudo umount /mnt/iso
+          sudo du -sh /mnt/work/rootfs
+
+      # ---------------------------------------------------------------
+      # PS4-specific configuration of the rootfs
+      # ---------------------------------------------------------------
+      - name: Configure rootfs for PS4
+        run: |
+          R=/mnt/work/rootfs
+          sudo cp -f /etc/resolv.conf $R/etc/resolv.conf
+
+          # -- 1. Disable CachyOS optimized repos (AVX2/BMI2/FMA) -------
+          # Jaguar (PS4 GCN2) lacks AVX2/BMI2/FMA. v3/v4/znver4 binaries
+          # would SIGILL. Only generic x86-64 repos may stay enabled.
+          echo ":: disabling x86-64-v3/v4/znver4 optimized repos (SIGILL on Jaguar)"
+          sudo sed -i -E 's/^[[:space:]]*(\[|Server[[:space:]]*=.*(v3|v4|znver4))/#&/I' \
+               $R/etc/pacman.conf || true
+          sudo grep -nE '^\s*\[.*(v3|v4|znver4)' $R/etc/pacman.conf || \
+            echo "  (no optimized repos enabled - good)"
+
+          # -- 2. Drop the CachyOS kernel; we boot an external bzImage ---
+          sudo rm -rf $R/usr/lib/modules/*
+          sudo rm -f  $R/boot/vmlinuz* $R/boot/initramfs* 2>/dev/null || true
+
+          # -- 3. Replace Mesa with PS4-patched build -------------------
+          echo ":: installing PS4-patched Mesa 26.0.4"
+          for p in ps4video/*.pkg.tar.zst; do
+            sudo tar --zstd -xf "$p" -C $R
+          done
+
+          # -- 4. AMDGPU (Liverpool) firmware ---------------------------
+          echo ":: installing amdgpu liverpool firmware"
+          sudo mkdir -p $R/usr/lib/firmware/amdgpu $R/usr/lib/firmware/mrvl
+          sudo cp $GITHUB_WORKSPACE/firmware/amdgpu/*.bin $R/usr/lib/firmware/amdgpu/
+          sudo cp $GITHUB_WORKSPACE/firmware/mrvl/* $R/usr/lib/firmware/mrvl/ 2>/dev/null || true
+          ls $R/usr/lib/firmware/amdgpu/ | head
+
+          # -- 5. fstab: rootfs is identified by LABEL, never /dev/sdX --
+          echo "LABEL=psxitarch / ext4 rw,noatime 0 1" | sudo tee $R/etc/fstab >/dev/null
+
+          # -- 6. Root password (hash injected straight into /etc/shadow)
+          HASH=$(openssl passwd -6 "root")
+          sudo sed -i "s|^root:[^:]*:|root:$HASH:|" $R/etc/shadow
+          echo ":: root password is 'root' - change it after first boot"
+
+          echo ":: rootfs configured"
+
+      # ---------------------------------------------------------------
+      # Strip bloat so the artifact fits upload limits
+      # ---------------------------------------------------------------
+      - name: Strip rootfs
+        run: |
+          R=/mnt/work/rootfs
+          echo "before: $(sudo du -sh $R | cut -f1)"
+          sudo rm -rf  $R/var/cache/pacman/pkg/* $R/var/log/* $R/var/tmp/* 2>/dev/null || true
+          sudo find $R/usr/share/doc -mindepth 1 -delete 2>/dev/null || true
+          sudo find $R/usr/share/man  -mindepth 1 -delete 2>/dev/null || true
+          sudo find $R/usr/share/info -mindepth 1 -delete 2>/dev/null || true
+          # keep only English locale
+          sudo find $R/usr/share/locale -mindepth 1 -maxdepth 1 ! -name 'en' ! -name 'locale.alias' -exec rm -rf {} + 2>/dev/null || true
+          echo "after:  $(sudo du -sh $R | cut -f1)"
+
+      # ---------------------------------------------------------------
+      # Compress and split (<=1.8GB parts)
+      # ---------------------------------------------------------------
+      - name: Package rootfs
+        run: |
+          cd /mnt/work
+          sudo tar --zstd -cf - --numeric-owner --xattrs --acls rootfs \
+            | zstd -19 -T0 -o ps4linux-rootfs.tar.zst -f
+          ls -lh ps4linux-rootfs.tar.zst
+          split -b 1800M -d -a 2 ps4linux-rootfs.tar.zst out/part-
+          ls -lh out/
+          sudo chown -R "$(id -u):$(id -g)" out/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ps4-cachyos-rootfs
+          path: out/part-*
+          retention-days: 30
+          compression-level: 0
+
+      - name: Summary
+        run: |
+          {
+            echo "### PS4 CachyOS rootfs built"
+            echo ""
+            echo "ISO version: \`$ISO_VERSION\`"
+            echo ""
+            echo "Reassemble locally with:"
+            echo '```'
+            echo "cat part-* > ps4linux-rootfs.tar.zst"
+            echo "zstd -d ps4linux-rootfs.tar.zst"
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY
