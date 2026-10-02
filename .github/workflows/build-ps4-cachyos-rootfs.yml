@@ -151,13 +151,21 @@ jobs:
       # ---------------------------------------------------------------
       - name: Package rootfs
         run: |
+          set -o pipefail
+          # /mnt/work was created by sudo mkdir -> root-owned. Fix ownership
+          # so the runner user can write the tarball, or zstd gets EACCES.
+          sudo chown -R "$(id -u):$(id -g)" /mnt/work
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          df -h /mnt/work "$GITHUB_WORKSPACE"
           cd /mnt/work
           sudo tar --zstd -cf - --numeric-owner --xattrs --acls rootfs \
-            | zstd -19 -T0 -o ps4linux-rootfs.tar.zst -f
-          ls -lh ps4linux-rootfs.tar.zst
-          split -b 1800M -d -a 2 ps4linux-rootfs.tar.zst out/part-
-          ls -lh out/
-          sudo chown -R "$(id -u):$(id -g)" out/
+            | zstd -19 -T0 -o "$GITHUB_WORKSPACE/out/ps4linux-rootfs.tar.zst" -f
+          ls -lh "$GITHUB_WORKSPACE/out/ps4linux-rootfs.tar.zst"
+          split -b 1800M -d -a 2 \
+            "$GITHUB_WORKSPACE/out/ps4linux-rootfs.tar.zst" \
+            "$GITHUB_WORKSPACE/out/part-"
+          rm -f "$GITHUB_WORKSPACE/out/ps4linux-rootfs.tar.zst"
+          ls -lh "$GITHUB_WORKSPACE/out/"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
