@@ -1,7 +1,9 @@
 name: build-mesa-ps4
 
 # Builds Mesa (latest stable) + the PS4 "Liverpool" patch into a host-installable
-# pacman package (mesa-ps4), inside an Arch Linux container (for a matching LLVM).
+# pacman package (mesa-ps4), inside an Arch Linux container (matching host LLVM).
+# Caches: the upstream source tarball (downloads) and ccache (compiled objects),
+# both saved even when the build fails so re-runs are much faster.
 
 on:
   workflow_dispatch:
@@ -15,29 +17,51 @@ jobs:
   build:
     runs-on: ubuntu-latest
     container: archlinux:latest
-    timeout-minutes: 180
+    timeout-minutes: 240
 
     steps:
       - name: Install build dependencies
         run: |
           pacman -Syu --noconfirm --needed \
-            base-devel git meson ninja \
+            base-devel git meson ninja ccache \
             python-mako python-ply python-packaging python-pyaml \
             glslang directx-headers wayland-protocols libxml2 libxrandr \
             elfutils xorgproto libva llvm clang libclc \
             spirv-llvm-translator spirv-tools
 
-      - name: Show toolchain versions
-        run: |
-          meson --version; ninja --version; gcc --version | head -1
-          pacman -Q llvm llvm-libs clang 2>/dev/null || true
-
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Create unprivileged build user
+      - name: Restore source tarball cache
+        id: cache-src
+        uses: actions/cache/restore@v4
+        with:
+          path: srcdest
+          key: srcdest-mesa-${{ github.event.inputs.mesa_version }}
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ccache-mesa-${{ github.event.inputs.mesa_version }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-mesa-${{ github.event.inputs.mesa_version }}-
+            ccache-mesa-
+
+      - name: Prepare build user, source cache and ccache
         run: |
+          set -euo pipefail
+          V="${{ github.event.inputs.mesa_version }}"
           useradd -m build
+          mkdir -p srcdest .ccache
+          if [ ! -s "srcdest/mesa-$V.tar.gz" ]; then
+            echo "downloading Mesa $V tarball..."
+            curl -sSL --retry 3 -o "srcdest/mesa-$V.tar.gz" \
+              "https://gitlab.freedesktop.org/mesa/mesa/-/archive/mesa-$V/mesa-mesa-$V.tar.gz"
+          else
+            echo "source tarball from cache"
+          fi
+          cp -f "srcdest/mesa-$V.tar.gz" "mesa-ps4/mesa-$V.tar.gz"
           chown -R build:build "$GITHUB_WORKSPACE"
 
       - name: Build mesa-ps4 (with PS4 patch)
@@ -45,14 +69,32 @@ jobs:
         run: |
           set -euo pipefail
           sed -i "s/^pkgver=.*/pkgver=${{ github.event.inputs.mesa_version }}/" PKGBUILD
-          echo "--- PKGBUILD version / sources ---"
-          grep -E '^pkgver=|^source=|ps4-mesa.patch' PKGBUILD || true
-          echo "--- applying PS4 patch (dry-run) ---"
-          su build -c "makepkg --noconfirm --nodeps"
-          echo "--- artifacts ---"
+          grep -E '^pkgver=' PKGBUILD
+          su build -c "CCACHE_DIR=$PWD/../.ccache CCACHE_COMPILERCHECK=content CCACHE_BASEDIR=$PWD \
+              CC='ccache gcc' CXX='ccache g++' \
+              makepkg --noconfirm --nodeps"
           ls -lh *.pkg.tar.zst
 
+      - name: ccache stats
+        if: always()
+        run: CCACHE_DIR="$GITHUB_WORKSPACE/.ccache" ccache -s 2>&1 | head -30 || true
+
+      - name: Save ccache (even on failure)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ccache-mesa-${{ github.event.inputs.mesa_version }}-${{ github.run_id }}
+
+      - name: Save source tarball cache
+        if: always() && steps.cache-src.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: srcdest
+          key: srcdest-mesa-${{ github.event.inputs.mesa_version }}
+
       - name: Upload package
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: mesa-ps4-${{ github.event.inputs.mesa_version }}
