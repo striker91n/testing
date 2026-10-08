@@ -1,0 +1,84 @@
+# Maintainer: PS4 host build (derived from centi07 / DionKill ps4-video-archlinux)
+# Builds upstream Mesa (latest stable) with the PS4 "Liverpool" GPU patch.
+
+pkgname=mesa-ps4
+pkgver=26.2.4
+pkgrel=1
+pkgdesc="Mesa patched for the PS4 Liverpool GPU (RADV + radeonsi)"
+arch=('x86_64')
+url="https://www.mesa3d.org"
+license=('custom')
+
+depends=(
+  'libdrm' 'libxxf86vm' 'libxdamage' 'libxshmfence' 'libelf' 'libunwind'
+  'libglvnd' 'wayland' 'lm_sensors' 'vulkan-icd-loader' 'zstd' 'expat'
+  'gcc-libs' 'libxfixes' 'libx11' 'systemd-libs' 'libxext' 'libxcb'
+  'glibc' 'zlib' 'python' 'xcb-util-keysyms'
+)
+makedepends=(
+  'meson' 'ninja' 'python-mako' 'python-ply' 'python-packaging' 'python-pyaml'
+  'glslang' 'directx-headers' 'wayland-protocols' 'libxml2' 'libxrandr'
+  'elfutils' 'xorgproto' 'libva' 'llvm' 'clang' 'libclc'
+  'spirv-llvm-translator' 'spirv-tools'
+)
+provides=(
+  'vulkan-mesa-layers' 'opencl-driver' 'opengl-driver' 'vulkan-driver'
+  'vulkan-intel' 'vulkan-nouveau' 'vulkan-radeon' 'vulkan-swrast'
+  'vulkan-virtio' 'libva-mesa-driver' 'mesa-libgl' 'mesa'
+  'vulkan-mesa-device-select'
+)
+conflicts=(
+  'vulkan-mesa-layers' 'opencl-clover-mesa' 'vulkan-intel' 'vulkan-nouveau'
+  'vulkan-radeon' 'vulkan-swrast' 'vulkan-virtio' 'libva-mesa-driver'
+  'mesa-libgl' 'mesa' 'vulkan-mesa-device-select'
+)
+options=('!lto' '!debug')
+
+source=(
+  "mesa-${pkgver}.tar.gz::https://gitlab.freedesktop.org/mesa/mesa/-/archive/mesa-${pkgver}/mesa-mesa-${pkgver}.tar.gz"
+  'ps4-mesa.patch'
+)
+sha256sums=('SKIP' 'SKIP')
+
+prepare() {
+  cd "mesa-mesa-${pkgver}"
+  patch -p1 -i "$srcdir/ps4-mesa.patch"
+}
+
+build() {
+  cd "mesa-mesa-${pkgver}"
+  CFLAGS+=' -g1'
+  CXXFLAGS+=' -g1'
+
+  meson setup _build \
+    --prefix=/usr --sysconfdir=/etc \
+    --buildtype=release --wrap-mode=nofallback \
+    -D android-libbacktrace=disabled \
+    -D egl=enabled -D glx=dri -D glvnd=enabled -D gbm=enabled \
+    -D gles1=disabled -D gles2=enabled -D opengl=true \
+    -D gallium-drivers=radeonsi,llvmpipe,softpipe,zink \
+    -D gallium-va=enabled -D gallium-vdpau=disabled \
+    -D gallium-rusticl=false -D gallium-extra-hud=true \
+    -D vulkan-drivers=amd \
+    -D vulkan-layers=device-select,overlay \
+    -D platforms=x11,wayland \
+    -D llvm=enabled -D lmsensors=enabled -D libunwind=enabled \
+    -D video-codecs=all -D zstd=enabled \
+    -D microsoft-clc=disabled -D valgrind=disabled -D tools=
+  meson configure --no-pager _build
+  ninja -C _build
+}
+
+package() {
+  cd "mesa-mesa-${pkgver}"
+  DESTDIR="$pkgdir" ninja -C _build install
+
+  # remove the overlay helper (matches the upstream Arch package)
+  rm -f "$pkgdir/usr/bin/mesa-overlay-control.py"
+  rmdir "$pkgdir/usr/bin" 2>/dev/null || true
+
+  # indirect rendering symlink (required)
+  ln -sf /usr/lib/libGLX_mesa.so.0 "$pkgdir/usr/lib/libGLX_indirect.so.0"
+
+  install -d -m755 "$pkgdir/usr/share/licenses/$pkgname"
+}

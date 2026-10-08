@@ -1,0 +1,60 @@
+name: build-mesa-ps4
+
+# Builds Mesa (latest stable) + the PS4 "Liverpool" patch into a host-installable
+# pacman package (mesa-ps4), inside an Arch Linux container (for a matching LLVM).
+
+on:
+  workflow_dispatch:
+    inputs:
+      mesa_version:
+        description: "Mesa version to build (latest stable, e.g. 26.2.4)"
+        required: true
+        default: "26.2.4"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          pacman -Syu --noconfirm --needed \
+            base-devel git meson ninja \
+            python-mako python-ply python-packaging python-pyaml \
+            glslang directx-headers wayland-protocols libxml2 libxrandr \
+            elfutils xorgproto libva llvm clang libclc \
+            spirv-llvm-translator spirv-tools
+
+      - name: Show toolchain versions
+        run: |
+          meson --version; ninja --version; gcc --version | head -1
+          pacman -Q llvm llvm-libs clang 2>/dev/null || true
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create unprivileged build user
+        run: |
+          useradd -m build
+          chown -R build:build "$GITHUB_WORKSPACE"
+
+      - name: Build mesa-ps4 (with PS4 patch)
+        working-directory: mesa-ps4
+        run: |
+          set -euo pipefail
+          sed -i "s/^pkgver=.*/pkgver=${{ github.event.inputs.mesa_version }}/" PKGBUILD
+          echo "--- PKGBUILD version / sources ---"
+          grep -E '^pkgver=|^source=|ps4-mesa.patch' PKGBUILD || true
+          echo "--- applying PS4 patch (dry-run) ---"
+          su build -c "makepkg --noconfirm --nodeps"
+          echo "--- artifacts ---"
+          ls -lh *.pkg.tar.zst
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: mesa-ps4-${{ github.event.inputs.mesa_version }}
+          path: mesa-ps4/*.pkg.tar.zst
+          if-no-files-found: error
