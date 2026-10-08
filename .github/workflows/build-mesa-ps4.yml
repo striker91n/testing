@@ -24,6 +24,10 @@ jobs:
         run: |
           pacman -Syu --noconfirm --needed \
             base-devel git meson ninja ccache \
+            libdrm libxxf86vm libxdamage libxshmfence libelf libunwind \
+            libglvnd wayland lm_sensors vulkan-icd-loader zstd expat \
+            libxfixes libx11 systemd-libs libxext libxcb python xcb-util-keysyms \
+            libdisplay-info \
             python-mako python-ply python-packaging python-pyaml \
             glslang directx-headers wayland-protocols libxml2 libxrandr \
             elfutils xorgproto libva llvm clang libclc \
