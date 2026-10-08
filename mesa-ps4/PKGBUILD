@@ -57,7 +57,7 @@ build() {
     -D egl=enabled -D glx=dri -D glvnd=enabled -D gbm=enabled \
     -D gles1=disabled -D gles2=enabled -D opengl=true \
     -D gallium-drivers=radeonsi,llvmpipe,softpipe,zink \
-    -D gallium-va=enabled -D gallium-vdpau=disabled \
+    -D gallium-va=enabled \
     -D gallium-rusticl=false -D gallium-extra-hud=true \
     -D vulkan-drivers=amd \
     -D vulkan-layers=device-select,overlay \
