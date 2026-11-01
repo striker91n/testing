@@ -196,30 +196,50 @@
  #include "radv_cmd_buffer.h"
  #include "meta/radv_meta.h"
  #include "tools/radv_debug_hang.h"
-@@ -14808,7 +14810,26 @@
-          radeon_emit(S_00B824_NUM_THREAD_FULL(cs_block_size[2]) | S_00B824_NUM_THREAD_PARTIAL(remainder[2]));
-          radeon_end();
- 
--         dispatch_initiator |= S_00B800_PARTIAL_TG_EN(1);
-+         /* PS4 "Liverpool" (GFX7) erratum: kicking off a dispatch with
-+          * PARTIAL_TG_EN set while PARTIAL == FULL (i.e. nothing is actually
-+          * partial, which is the common case: RADV always marks internal
-+          * radv_unaligned_dispatch() launches as "unaligned") makes the CP
-+          * never retire a single wave. The following CS_PARTIAL_FLUSH then
-+          * waits forever and the ring times out ("soft recovered"); the app
-+          * either loses the device or silently gets its work dropped.
+@@ -14805,10 +14807,44 @@
+             radeon_emit(S_00B81C_NUM_THREAD_FULL_GFX6(cs_block_size[0]) | S_00B81C_NUM_THREAD_PARTIAL(remainder[0]));
+             radeon_emit(S_00B820_NUM_THREAD_FULL_GFX6(cs_block_size[1]) | S_00B820_NUM_THREAD_PARTIAL(remainder[1]));
+          }
+-         radeon_emit(S_00B824_NUM_THREAD_FULL(cs_block_size[2]) | S_00B824_NUM_THREAD_PARTIAL(remainder[2]));
+-         radeon_end();
++         /* PS4 "Liverpool" (GFX7 / CIK) erratum: the CP wedges when the
++          * PARTIAL thread-group fields are inconsistent with PARTIAL_TG_EN.
 +          *
-+          * Only assert PARTIAL_TG_EN when a real partial thread group exists
-+          * on GFX6-8. The dispatch geometry is unchanged (same number of
-+          * full thread groups), so this is a no-op apart from the bad bit.
++          * RADV's radv_unaligned_dispatch() marks internal meta launches
++          * (compute fill/copy/blit/HiZ-clear) as unaligned, and this branch
++          * then always writes NUM_THREAD_PARTIAL = block_size when the block
++          * divides evenly, together with PARTIAL_TG_EN=1. Both halves are
++          * illegal here because nothing is actually partial:
++          *   - PARTIAL_TG_EN=1 with PARTIAL == FULL -> waves never retire and
++          *     the following CS_PARTIAL_FLUSH waits forever (ring timeout,
++          *     "soft recovered"); work is silently dropped.
++          *   - PARTIAL_TG_EN=0 with PARTIAL == FULL -> same wedge, so merely
++          *     clearing the bit is not enough.
++          *
++          * The only legal states are (PARTIAL_TG_EN=0, PARTIAL=0) for a fully
++          * aligned grid, and (PARTIAL_TG_EN=1, PARTIAL<FULL) for a real
++          * partial group -- which is exactly what radeonsi does (it derives
++          * partial[] from last_block, zero when the block divides evenly).
++          *
++          * Do the same for GFX6-8. Dispatch geometry is unchanged (same full
++          * thread groups); the shaders clamp their offsets, so the extra
++          * invocations of a non-partial last group are harmless.
 +          * RADV_GFX7_PARTIAL_TG=1 restores the old behaviour (A/B testing).
 +          */
 +         const bool has_partial_tg = remainder[0] != cs_block_size[0] ||
 +                                     remainder[1] != cs_block_size[1] ||
 +                                     remainder[2] != cs_block_size[2];
 +
-+         if (pdev->info.gfx_level >= GFX9 || has_partial_tg ||
-+             getenv("RADV_GFX7_PARTIAL_TG"))
++         const bool old_behaviour = getenv("RADV_GFX7_PARTIAL_TG") != NULL;
++
++         if (pdev->info.gfx_level <= GFX8 && !has_partial_tg && !old_behaviour) {
++            remainder[0] = 0;
++            remainder[1] = 0;
++            remainder[2] = 0;
++         }
+ 
+-         dispatch_initiator |= S_00B800_PARTIAL_TG_EN(1);
++         if (pdev->info.gfx_level >= GFX9 || has_partial_tg || old_behaviour)
 +            dispatch_initiator |= S_00B800_PARTIAL_TG_EN(1);
        }
  
