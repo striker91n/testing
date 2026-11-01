@@ -3,7 +3,7 @@
 
 pkgname=mesa-ps4
 pkgver=26.2.4
-pkgrel=1
+pkgrel=2
 pkgdesc="Mesa patched for the PS4 Liverpool GPU (RADV + radeonsi)"
 arch=('x86_64')
 url="https://www.mesa3d.org"

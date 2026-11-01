@@ -185,3 +185,42 @@
      CHIP_KAVERI,
      CHIP_KABINI,
      CHIP_HAWAII,
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -8,6 +8,8 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include <stdlib.h>
++
+ #include "radv_cmd_buffer.h"
+ #include "meta/radv_meta.h"
+ #include "tools/radv_debug_hang.h"
+@@ -14808,7 +14810,26 @@
+          radeon_emit(S_00B824_NUM_THREAD_FULL(cs_block_size[2]) | S_00B824_NUM_THREAD_PARTIAL(remainder[2]));
+          radeon_end();
+ 
+-         dispatch_initiator |= S_00B800_PARTIAL_TG_EN(1);
++         /* PS4 "Liverpool" (GFX7) erratum: kicking off a dispatch with
++          * PARTIAL_TG_EN set while PARTIAL == FULL (i.e. nothing is actually
++          * partial, which is the common case: RADV always marks internal
++          * radv_unaligned_dispatch() launches as "unaligned") makes the CP
++          * never retire a single wave. The following CS_PARTIAL_FLUSH then
++          * waits forever and the ring times out ("soft recovered"); the app
++          * either loses the device or silently gets its work dropped.
++          *
++          * Only assert PARTIAL_TG_EN when a real partial thread group exists
++          * on GFX6-8. The dispatch geometry is unchanged (same number of
++          * full thread groups), so this is a no-op apart from the bad bit.
++          * RADV_GFX7_PARTIAL_TG=1 restores the old behaviour (A/B testing).
++          */
++         const bool has_partial_tg = remainder[0] != cs_block_size[0] ||
++                                     remainder[1] != cs_block_size[1] ||
++                                     remainder[2] != cs_block_size[2];
++
++         if (pdev->info.gfx_level >= GFX9 || has_partial_tg ||
++             getenv("RADV_GFX7_PARTIAL_TG"))
++            dispatch_initiator |= S_00B800_PARTIAL_TG_EN(1);
+       }
+ 
+       if (grid_size_offset) {
