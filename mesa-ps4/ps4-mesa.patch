@@ -185,62 +185,43 @@
      CHIP_KAVERI,
      CHIP_KABINI,
      CHIP_HAWAII,
---- a/src/amd/vulkan/radv_cmd_buffer.c
-+++ b/src/amd/vulkan/radv_cmd_buffer.c
-@@ -8,6 +8,8 @@
+--- a/src/amd/vulkan/meta/radv_meta_buffer.c
++++ b/src/amd/vulkan/meta/radv_meta_buffer.c
+@@ -7,6 +7,8 @@
   * SPDX-License-Identifier: MIT
   */
  
 +#include <stdlib.h>
 +
- #include "radv_cmd_buffer.h"
- #include "meta/radv_meta.h"
+ #include "nir/radv_meta_nir.h"
  #include "tools/radv_debug_hang.h"
-@@ -14805,10 +14807,44 @@
-             radeon_emit(S_00B81C_NUM_THREAD_FULL_GFX6(cs_block_size[0]) | S_00B81C_NUM_THREAD_PARTIAL(remainder[0]));
-             radeon_emit(S_00B820_NUM_THREAD_FULL_GFX6(cs_block_size[1]) | S_00B820_NUM_THREAD_PARTIAL(remainder[1]));
-          }
--         radeon_emit(S_00B824_NUM_THREAD_FULL(cs_block_size[2]) | S_00B824_NUM_THREAD_PARTIAL(remainder[2]));
--         radeon_end();
-+         /* PS4 "Liverpool" (GFX7 / CIK) erratum: the CP wedges when the
-+          * PARTIAL thread-group fields are inconsistent with PARTIAL_TG_EN.
-+          *
-+          * RADV's radv_unaligned_dispatch() marks internal meta launches
-+          * (compute fill/copy/blit/HiZ-clear) as unaligned, and this branch
-+          * then always writes NUM_THREAD_PARTIAL = block_size when the block
-+          * divides evenly, together with PARTIAL_TG_EN=1. Both halves are
-+          * illegal here because nothing is actually partial:
-+          *   - PARTIAL_TG_EN=1 with PARTIAL == FULL -> waves never retire and
-+          *     the following CS_PARTIAL_FLUSH waits forever (ring timeout,
-+          *     "soft recovered"); work is silently dropped.
-+          *   - PARTIAL_TG_EN=0 with PARTIAL == FULL -> same wedge, so merely
-+          *     clearing the bit is not enough.
-+          *
-+          * The only legal states are (PARTIAL_TG_EN=0, PARTIAL=0) for a fully
-+          * aligned grid, and (PARTIAL_TG_EN=1, PARTIAL<FULL) for a real
-+          * partial group -- which is exactly what radeonsi does (it derives
-+          * partial[] from last_block, zero when the block divides evenly).
-+          *
-+          * Do the same for GFX6-8. Dispatch geometry is unchanged (same full
-+          * thread groups); the shaders clamp their offsets, so the extra
-+          * invocations of a non-partial last group are harmless.
-+          * RADV_GFX7_PARTIAL_TG=1 restores the old behaviour (A/B testing).
-+          */
-+         const bool has_partial_tg = remainder[0] != cs_block_size[0] ||
-+                                     remainder[1] != cs_block_size[1] ||
-+                                     remainder[2] != cs_block_size[2];
-+
-+         const bool old_behaviour = getenv("RADV_GFX7_PARTIAL_TG") != NULL;
-+
-+         if (pdev->info.gfx_level <= GFX8 && !has_partial_tg && !old_behaviour) {
-+            remainder[0] = 0;
-+            remainder[1] = 0;
-+            remainder[2] = 0;
-+         }
+ #include "radv_cp_dma.h"
+@@ -237,6 +239,28 @@
+    const struct radv_physical_device *pdev = radv_device_physical(device);
+    bool use_compute = size >= RADV_BUFFER_OPS_CS_THRESHOLD;
  
--         dispatch_initiator |= S_00B800_PARTIAL_TG_EN(1);
-+         if (pdev->info.gfx_level >= GFX9 || has_partial_tg || old_behaviour)
-+            dispatch_initiator |= S_00B800_PARTIAL_TG_EN(1);
-       }
- 
-       if (grid_size_offset) {
++   /* PS4 "Liverpool" (GFX7 / CIK) erratum: RADV's internal buffer fill/copy
++    * meta shaders (radv_meta_nir.c) take a raw 64-bit GPU address in push
++    * constants and access it with store_global_amd()/load_global_amd(), i.e.
++    * flat/global memory instructions instead of a descriptor. Such a compute
++    * dispatch never retires on CIK: the CP waits for the waves forever, the
++    * gfx ring times out ("soft recovered") and the work is silently dropped
++    * (the fence still signals). Reproductor: vkCmdFillBuffer(>= 4KB) or
++    * vkCmdCopyBuffer() returns success but the destination is never written.
++    *
++    * Every buffer fill/copy >= 4KB goes through that path, including internal
++    * ones: RADV uses a buffer fill to initialise HiZ/HTILE metadata, so even
++    * vkcube/vkmark/DXVK hang with HiZ enabled.
++    *
++    * Meta shaders that access memory through image/texel descriptors (image
++    * clear, buffer<->image copies, resolves, decompression) are unaffected and
++    * keep using compute. Route only buffer fill/copy through the CP DMA
++    * engine, which is what RADV already does for transfers < 4KB.
++    * RADV_GFX7_META_BUF_CS=1 restores the old behaviour (A/B testing).
++    */
++   if (pdev->info.gfx_level <= GFX8 && !getenv("RADV_GFX7_META_BUF_CS"))
++      use_compute = false;
++
+    if (pdev->info.gfx_level >= GFX10 && pdev->info.has_dedicated_vram) {
+       if (!(src_copy_flags & VK_ADDRESS_COPY_DEVICE_LOCAL_BIT_KHR) ||
+           !(dst_copy_flags & VK_ADDRESS_COPY_DEVICE_LOCAL_BIT_KHR)) {
