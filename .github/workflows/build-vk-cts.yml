@@ -1,0 +1,113 @@
+name: build-vk-cts
+
+# Builds Khronos VK-GL-CTS (deqp-vk) in an Arch container and ships a portable
+# tarball. deqp-vk is the official Vulkan conformance suite: it covers the whole
+# API surface (~1M test cases), so it can tell us exactly which Vulkan
+# features/functions are broken on Liverpool instead of guessing.
+#
+# target=null    -> headless, no window-system tests (needs no display)
+# target=wayland -> also builds WSI (swapchain/surface) tests for Wayland
+
+on:
+  workflow_dispatch:
+    inputs:
+      cts_tag:
+        description: "VK-GL-CTS tag"
+        required: true
+        default: "vulkan-cts-1.4.7.1"
+      target:
+        description: "DEQP_TARGET (null | wayland)"
+        required: true
+        default: "null"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    timeout-minutes: 300
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          pacman -Syu --noconfirm --needed \
+            base-devel git cmake ninja ccache python \
+            python-numpy zlib libpng \
+            vulkan-headers vulkan-icd-loader \
+            wayland wayland-protocols libxkbcommon libx11 libxcb xorgproto \
+            libglvnd mesa
+
+      - name: Restore ccache
+        id: cache-cc
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ccache-vkcts-${{ github.event.inputs.cts_tag }}-${{ github.event.inputs.target }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-vkcts-${{ github.event.inputs.cts_tag }}-${{ github.event.inputs.target }}-
+            ccache-vkcts-
+
+      - name: Fetch CTS source
+        run: |
+          set -euo pipefail
+          curl -sSL --retry 3 -o cts.tar.gz \
+            "https://codeload.github.com/KhronosGroup/VK-GL-CTS/tar.gz/refs/tags/${{ github.event.inputs.cts_tag }}"
+          mkdir -p src
+          tar xzf cts.tar.gz -C src --strip-components=1
+          ls src | head
+
+      - name: Fetch external sources (glslang, spirv-tools, ...)
+        working-directory: src
+        run: python3 external/fetch_sources.py
+
+      - name: Configure
+        working-directory: src
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_FLAGS="-g0 -O2" \
+            -DCMAKE_CXX_FLAGS="-g0 -O2" \
+            -DDEQP_TARGET=${{ github.event.inputs.target }} \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      - name: Build deqp-vk
+        working-directory: src
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+          CCACHE_COMPILERCHECK: content
+        run: cmake --build build --target deqp-vk -j"$(nproc)"
+
+      - name: ccache stats
+        if: always()
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+        run: ccache -s 2>&1 | head -30 || true
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ccache-vkcts-${{ github.event.inputs.cts_tag }}-${{ github.event.inputs.target }}-${{ github.run_id }}
+
+      - name: Package
+        if: success()
+        run: |
+          set -euo pipefail
+          BIN="$(find src/build -type f -name deqp-vk | head -1)"
+          echo "built: $BIN"
+          test -n "$BIN"
+          mkdir -p pkg
+          cp "$BIN" pkg/deqp-vk
+          strip pkg/deqp-vk || true
+          ls -lh pkg/deqp-vk
+          tar czf "deqp-vk-${{ github.event.inputs.cts_tag }}-${{ github.event.inputs.target }}-x86_64.tar.gz" -C pkg .
+
+      - name: Upload suite
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deqp-vk-${{ github.event.inputs.cts_tag }}-${{ github.event.inputs.target }}
+          path: deqp-vk-*.tar.gz
+          if-no-files-found: error
